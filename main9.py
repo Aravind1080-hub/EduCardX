@@ -1,14 +1,6 @@
 import os
 import sys
 import time
-import warnings
- 
-os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")            # Chroma telemetry errors
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")          # HuggingFace tokenizers fork warning
-os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")     # HuggingFace symlink warning (Windows)
-os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
-warnings.filterwarnings("ignore", category=FutureWarning)
-warnings.filterwarnings("ignore", category=DeprecationWarning)
  
 # Prevent UnicodeEncodeError when printing emojis on Windows consoles
 for _stream in (sys.stdout, sys.stderr):
@@ -21,6 +13,11 @@ import re
 import json
 import uuid
 import traceback
+import math
+from collections import Counter, OrderedDict
+from dataclasses import dataclass
+from threading import RLock
+import docx2txt
 import requests
 import redis
 from typing import Optional
@@ -30,11 +27,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openai import OpenAI
-from langchain_chroma import Chroma
-from langchain_community.document_loaders import Docx2txtLoader
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
  
  
 # ==========================================
@@ -50,6 +43,7 @@ from pydantic import BaseModel
  
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE_DIR, ".env"))
+DOCUMENTS_DIR = os.path.abspath(os.getenv("DOCUMENTS_DIR", BASE_DIR))
  
 SERPER_API_KEY = os.getenv("SERPER_API_KEY")
 OX_API_KEY = os.getenv("OX_API_KEY")
@@ -73,10 +67,8 @@ client = OpenAI(
  
 OX_PARAMS = {
     "temperature": 0.3,
-    # OX Alpha is a reasoning model: reasoning tokens can count toward this limit,
-    # so it is set higher than the old 600 to avoid empty/cut-off answers.
-    # The STYLE RULES in the prompt still keep answers short.
-    "max_tokens": 1000000,
+    # Bound each response for the small instance; configurable for your model.
+    "max_tokens": max(256, min(int(os.getenv("OX_MAX_TOKENS", "2048")), 8192)),
 }
  
 # Asks the provider for less hidden reasoning = faster (OpenRouter-style).
@@ -138,14 +130,19 @@ def log_timings(label, timings):
 # Each session_id has its own list of messages.
 # ==========================================
  
-MAX_HISTORY_MESSAGES = 15     # last 20 messages are kept in storage
-HISTORY_TTL_SECONDS = 7200     # Redis only: history expires after 2 hours
+MAX_HISTORY_MESSAGES = 15     # last 15 exchanges, also bounded by characters
+HISTORY_TTL_SECONDS = 7200
+MAX_MEMORY_SESSIONS = 100
+MAX_HISTORY_MESSAGE_CHARS = 4000
+MAX_HISTORY_SESSION_CHARS = 20000
  
 try:
-    redis_client = redis.Redis(
-        host="localhost", port=6379, db=0,
-        decode_responses=True,
-        socket_connect_timeout=2, socket_timeout=2
+    redis_url = os.getenv("REDIS_URL")
+    if not redis_url and os.getenv("RENDER"):
+        raise redis.exceptions.ConnectionError("Using bounded in-memory history on Render.")
+    redis_client = redis.Redis.from_url(
+        redis_url or "redis://localhost:6379/0", decode_responses=True,
+        socket_connect_timeout=2, socket_timeout=2,
     )
     redis_client.ping()
     USE_REDIS = True
@@ -155,22 +152,49 @@ except (redis.exceptions.RedisError, OSError):
     USE_REDIS = False
     print("Redis not available, using in-memory chat history.")
  
-_memory_store = {}
+_memory_store = OrderedDict()
+_history_lock = RLock()
+
+
+def prune_expired_history():
+    now = time.monotonic()
+    for session_id, (expires_at, _) in list(_memory_store.items()):
+        if expires_at <= now:
+            del _memory_store[session_id]
  
  
 def get_history(session_id):
     if USE_REDIS:
         data = redis_client.get(f"chat:{session_id}")
         return json.loads(data) if data else []
-    return _memory_store.get(session_id, [])
+    with _history_lock:
+        prune_expired_history()
+        entry = _memory_store.get(session_id)
+        if entry is None:
+            return []
+        _memory_store.move_to_end(session_id)
+        return [dict(message) for message in entry[1]]
  
  
 def save_history(session_id, history):
-    history = history[-MAX_HISTORY_MESSAGES * 2:]   # keep storage small
+    bounded = []
+    remaining = MAX_HISTORY_SESSION_CHARS
+    for message in reversed(history[-MAX_HISTORY_MESSAGES * 2:]):
+        content = str(message.get("content", ""))[:MAX_HISTORY_MESSAGE_CHARS]
+        if len(content) > remaining:
+            break
+        bounded.append({"role": message["role"], "content": content})
+        remaining -= len(content)
+    history = list(reversed(bounded))
     if USE_REDIS:
         redis_client.set(f"chat:{session_id}", json.dumps(history), ex=HISTORY_TTL_SECONDS)
     else:
-        _memory_store[session_id] = history
+        with _history_lock:
+            prune_expired_history()
+            _memory_store[session_id] = (time.monotonic() + HISTORY_TTL_SECONDS, history)
+            _memory_store.move_to_end(session_id)
+            while len(_memory_store) > MAX_MEMORY_SESSIONS:
+                _memory_store.popitem(last=False)
  
  
 def format_history(history):
@@ -204,15 +228,108 @@ documents = [
 ]
  
  
-# Load Documents
-docs = []
+# Lightweight document search. BM25 ranks matching words without downloading
+# or loading PyTorch, sentence-transformers, Chroma, or any embedding model.
+# This is lexical retrieval: paraphrases can match less well than embeddings.
+@dataclass(frozen=True)
+class DocumentChunk:
+    page_content: str
+    source: str
+
+
+STOP_WORDS = set("""
+a an and are as at be been but by can could did do does for from had has have
+how i if in into is it its me my of on or our please should that the their
+them there these they this those to us was we were what when where which
+who why will with would you your educardx
+""".split())
+
+WORD_FORMS = {
+    "repayment": "repay", "repayments": "repay", "repaying": "repay",
+    "eligibility": "eligible", "financing": "finance", "financial": "finance",
+    "policies": "policy", "universities": "university",
+    "verification": "verify", "verified": "verify",
+    "instalment": "installment", "instalments": "installment",
+}
+
+
+def search_tokens(text):
+    tokens = []
+    for word in re.findall(r"[^\W_]+", text.casefold(), flags=re.UNICODE):
+        if word in STOP_WORDS:
+            continue
+        word = WORD_FORMS.get(word, word)
+        if len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            word = word[:-1]
+        tokens.append(word)
+    return tokens
+
+
+def split_document(text, source, size=700, overlap=100):
+    if size <= 0 or not 0 <= overlap < size:
+        raise ValueError("Chunk overlap must be smaller than its positive size.")
+    text = text.strip()
+    start = 0
+    while start < len(text):
+        end = min(start + size, len(text))
+        if end < len(text):
+            # Prefer paragraph boundaries, then words, in the latter half.
+            boundary = text.rfind("\n\n", start + size // 2, end)
+            if boundary < 0:
+                boundary = text.rfind(" ", start + size // 2, end)
+            if boundary >= 0:
+                end = boundary
+        chunk = text[start:end].strip()
+        if chunk:
+            yield DocumentChunk(chunk, source)
+        if end == len(text):
+            break
+        next_start = max(start + 1, end - overlap)
+        # Start the overlap at a word boundary, without leaving a gap.
+        while next_start < end and not text[next_start].isspace():
+            next_start += 1
+        start = next_start
+
+
+class KeywordRetriever:
+    def __init__(self, chunks, k=4):
+        if not chunks:
+            raise ValueError("Document search needs at least one chunk.")
+        self.chunks = list(chunks)
+        self.k = k
+        self.postings = {}
+        lengths = []
+        for index, chunk in enumerate(self.chunks):
+            frequencies = Counter(search_tokens(chunk.page_content))
+            # Later chunks still belong to their document's topic. Include its
+            # filename as a lightly boosted title so a repayment-policy section
+            # remains findable even when that section only says "late payments".
+            title = os.path.splitext(os.path.basename(chunk.source))[0]
+            frequencies.update(search_tokens(title) * 2)
+            lengths.append(sum(frequencies.values()))
+            for word, count in frequencies.items():
+                self.postings.setdefault(word, []).append((index, count))
+        average = sum(lengths) / len(lengths) or 1.0
+        self.length_penalties = [1.5 * (0.25 + 0.75 * length / average) for length in lengths]
+        self.idf = {
+            word: math.log1p((len(self.chunks) - len(entries) + 0.5) / (len(entries) + 0.5))
+            for word, entries in self.postings.items()
+        }
+
+    def invoke(self, query):
+        scores = Counter()
+        for word in set(search_tokens(query)):
+            for index, count in self.postings.get(word, ()):
+                scores[index] += self.idf[word] * count * 2.5 / (count + self.length_penalties[index])
+        # No matching words means no evidence, not unrelated fallback chunks.
+        return [self.chunks[index] for index, score in scores.most_common(self.k) if score > 0]
  
  
 def find_docx_files(name):
-    """Resolve an entry from `documents` to real .docx file path(s) next to main.py.
+    """Resolve an entry from `documents` to real .docx file path(s) in DOCUMENTS_DIR.
     Works if the entry is a .docx file (with or without extension, even with a
     suffix like "[1]") or a folder containing .docx files."""
-    path = os.path.join(BASE_DIR, name)
+    path = os.path.join(DOCUMENTS_DIR, name)
  
     # Entry is a folder -> every .docx inside it
     if os.path.isdir(path):
@@ -228,85 +345,39 @@ def find_docx_files(name):
  
     # Entry is a file name without extension / with a suffix like "[1]"
     return [
-        os.path.join(BASE_DIR, f)
-        for f in sorted(os.listdir(BASE_DIR))
+        os.path.join(DOCUMENTS_DIR, f)
+        for f in sorted(os.listdir(DOCUMENTS_DIR))
         if f.lower().endswith(".docx")
         and not f.startswith("~$")
         and f.startswith(name)
     ]
  
  
+chunks = []
+loaded_document_count = 0
 for file in documents:
  
     paths = find_docx_files(file)
  
     if not paths:
-        print(f"Warning: no .docx found for '{file}' in {BASE_DIR}, skipping.")
+        print(f"Warning: no .docx found for '{file}' in {DOCUMENTS_DIR}, skipping.")
         continue
  
     for file_path in paths:
         print(f"Loading document: {file_path}")
-        loader = Docx2txtLoader(file_path)
-        loaded_docs = loader.load()
-        for doc in loaded_docs:
-            doc.metadata["source"] = file_path
-        docs.extend(loaded_docs)
- 
-print(f"Loaded {len(docs)} documents")
- 
- 
-# chunking
-splitter = RecursiveCharacterTextSplitter(
-    chunk_size=700,
-    chunk_overlap=100)
-chunks = splitter.split_documents(docs)
+        document_text = docx2txt.process(file_path)
+        chunks.extend(split_document(document_text, file_path))
+        loaded_document_count += 1
+        del document_text
  
 if not chunks:
     raise RuntimeError(
-        f"No document content was loaded from {BASE_DIR}. "
+        f"No document content was loaded from {DOCUMENTS_DIR}. "
         "Place the EduCardX .docx files next to this script."
     )
  
-# Stable IDs: restarting the server re-uses the same IDs instead of adding
-# duplicate copies of every chunk to the persistent Chroma database.
-chunk_ids = [
-    str(uuid.uuid5(
-        uuid.NAMESPACE_URL,
-        f"{c.metadata.get('source', '')}|{i}|{c.page_content}"
-    ))
-    for i, c in enumerate(chunks)
-]
- 
- 
-# embeddings
-embeddings = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
- 
- 
-# Chroma Database
-vectorstore = Chroma.from_documents(
-    documents=chunks,
-    embedding=embeddings,
-    ids=chunk_ids,
-    persist_directory=os.path.join(BASE_DIR, "chroma_db")
-)
- 
- 
-# Retrieving
-retriever = vectorstore.as_retriever(
-    search_type="mmr",
-    search_kwargs={
-        "k": 4,
-        "fetch_k": 20
-    }
-)
- 
-# Warm-up: the first retrieval is slower (lazy loading), so do it at startup
-try:
-    retriever.invoke("warm up")
-except Exception as _e:
-    print(f"Warm-up skipped: {_e}")
+retriever = KeywordRetriever(chunks)
+print(f"Loaded {loaded_document_count} documents, {len(chunks)} chunks (lightweight keyword search).")
  
  
 # ==========================================
@@ -594,7 +665,7 @@ def build_prompt(user, history=None, timings=None):
         context = "\n\n".join(
             doc.page_content
             for doc in results
-        )
+        ) or "No matching EduCardX document passages were found for this question."
  
     # STEP 3: WEB SEARCH
     elif intent == "WEB_SEARCH":
@@ -779,8 +850,8 @@ app.add_middleware(
  
  
 class ChatRequest(BaseModel):
-    session_id: Optional[str] = None   # leave empty on the first message
-    message: str
+    session_id: Optional[str] = Field(default=None, max_length=128)
+    message: str = Field(max_length=8000)
  
  
 class ChatResponse(BaseModel):
@@ -803,7 +874,10 @@ class VoiceChatResponse(BaseModel):
  
 @app.get("/health")
 def health():
-    return {"status": "ok", "redis": USE_REDIS}
+    return {
+        "status": "ok", "redis": USE_REDIS,
+        "retrieval": "bm25", "documents": loaded_document_count, "chunks": len(chunks),
+    }
  
  
 # Text input (also use this when the app does on-device speech-to-text)
@@ -880,7 +954,8 @@ def clear_history(session_id: str):
     if USE_REDIS:
         redis_client.delete(f"chat:{session_id}")
     else:
-        _memory_store.pop(session_id, None)
+        with _history_lock:
+            _memory_store.pop(session_id, None)
     return {"session_id": session_id, "cleared": True}
  
  
@@ -966,8 +1041,8 @@ def voice_chat_stream(session_id: Optional[str] = None):
     )
  
  
-# Run:  python main8.py   (or: uvicorn main8:app --host 0.0.0.0 --port 8000)
+# Run: python main9.py (or: uvicorn main9:app --host 0.0.0.0 --port $PORT)
 if __name__ == "__main__":
     import uvicorn
  
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

@@ -1,16 +1,9 @@
 fastapi
-uvicorn[standard]
+uvicorn
 pydantic
 openai
 python-dotenv
 requests
 redis
-langchain-core
-langchain-community
-langchain-text-splitters
-langchain-chroma
-langchain-huggingface
-chromadb
-sentence-transformers
 docx2txt
 SpeechRecognition
