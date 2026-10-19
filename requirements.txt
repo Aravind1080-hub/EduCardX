@@ -1,17 +1,10 @@
- Web server
 fastapi
 uvicorn[standard]
 pydantic
- 
-# LLM (OX Alpha / GLM via OpenAI-compatible API)
 openai
- 
-# Config + HTTP + chat history
 python-dotenv
 requests
 redis
- 
-# RAG (documents, embeddings, vector DB)
 langchain-core
 langchain-community
 langchain-text-splitters
@@ -20,9 +13,4 @@ langchain-huggingface
 chromadb
 sentence-transformers
 docx2txt
- 
-# Speech recognition library (imported by main8.py)
 SpeechRecognition
-# PyAudio is only needed for server-side microphone input (local use).
-# Do NOT install it on Render: it needs the portaudio system library.
-# PyAudio
