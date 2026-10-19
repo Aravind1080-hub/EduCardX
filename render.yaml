@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: educardx
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main10:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: SERPER_API_KEY
+        sync: false
+      - key: OX_API_KEY
+        sync: false
+      - key: OX_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: OX_MODEL
+        value: z-ai/glm-5.3-flash
